@@ -1,0 +1,44 @@
+#!/usr/bin/make -f
+
+# Uncomment this to turn on verbose mode.
+export DH_VERBOSE=1
+
+MAKEARGS=DESTDIR=debian/haproxy \
+	 PREFIX=/usr \
+	 IGNOREGIT=true \
+	 MANDIR=/usr/share/man \
+	 DOCDIR=/usr/share/doc/haproxy \
+	 USE_PCRE=1 \
+	 USE_OPENSSL=1
+
+ifeq ($(shell dpkg-architecture -qDEB_HOST_ARCH_OS),linux)
+	MAKEARGS+= TARGET=linux26 \
+        USE_LINUX_SPLICE=1 \
+        USE_LINUX_TPROXY=1
+else
+	MAKEARGS+= TARGET=generic
+endif
+ifeq ($(shell dpkg-architecture -qDEB_HOST_ARCH_CPU),i386)
+	MAKEARGS+= USE_REGPARM=1
+endif
+
+%:
+	dh $@ 
+
+override_dh_auto_configure:
+	@echo applying Haproxy patches
+	for i in patches/*.diff; do if [ -s $$i ]; then echo "  $$i ..."; cat $$i | (patch -p1) || exit 1; fi; done
+
+override_dh_auto_build:
+	make $(MAKEARGS)
+
+override_dh_auto_install:
+	ls -la doc/*
+	make $(MAKEARGS) install
+	cp README debian/haproxy/usr/share/doc/haproxy
+	dh_installchangelogs CHANGELOG
+	mkdir -p debian/haproxy/etc/haproxy
+	cp -r examples/errorfiles debian/haproxy/etc/haproxy/errors
+	rm debian/haproxy/etc/haproxy/errors/README
+	cp debian/haproxy.cfg debian/haproxy/etc/haproxy
+
