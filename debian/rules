@@ -43,3 +43,5 @@ override_dh_auto_install:
 	rm debian/haproxy/etc/haproxy/errors/README
 	cp debian/haproxy.cfg debian/haproxy/etc/haproxy
 
+override_dh_installinit:
+	dh_installinit --no-start
