@@ -166,10 +166,24 @@ struct logformat_var_args var_args_list[] = {
  */
 static inline const char *fmt_directive(const struct proxy *curproxy)
 {
-	if (curproxy->conf.args.ctx == ARGC_UIF)
+	switch (curproxy->conf.args.ctx) {
+	case ARGC_UIF:
 		return "unique-id-format";
-	else
+	case ARGC_HRQ:
+		return "http-request";
+	case ARGC_HRS:
+		return "http-response";
+	case ARGC_STK:
+		return "stick";
+	case ARGC_TRK:
+		return "track-sc"; break;
+	case ARGC_RDR:
+		return "redirect"; break;
+	case ARGC_ACL:
+		return "acl"; break;
+	default:
 		return "log-format";
+	}
 }
 
 /*
@@ -268,12 +282,12 @@ int parse_logformat_var(char *arg, int arg_len, char *var, int var_len, struct p
 					LIST_ADDQ(list_format, &node->list);
 				}
 				if (logformat_keywords[j].replace_by)
-					Warning("parsing [%s:%d] : deprecated variable '%s' in '%s', please replace it with '%s'\n",
+					Warning("parsing [%s:%d] : deprecated variable '%s' in '%s', please replace it with '%s'.\n",
 					        curproxy->conf.args.file, curproxy->conf.args.line,
 					        logformat_keywords[j].name, fmt_directive(curproxy), logformat_keywords[j].replace_by);
 				return 0;
 			} else {
-				Warning("parsing [%s:%d] : '%s' variable name '%s' is reserved for HTTP mode\n",
+				Warning("parsing [%s:%d] : '%s' : format variable '%s' is reserved for HTTP mode.\n",
 				        curproxy->conf.args.file, curproxy->conf.args.line, fmt_directive(curproxy),
 				        logformat_keywords[j].name);
 				return -1;
@@ -283,7 +297,7 @@ int parse_logformat_var(char *arg, int arg_len, char *var, int var_len, struct p
 
 	j = var[var_len];
 	var[var_len] = 0;
-	Warning("parsing [%s:%d] : no such variable name '%s' in '%s'\n",
+	Warning("parsing [%s:%d] : no such format variable '%s' in '%s'. If you wanted to emit the '%%' character verbatim, you need to use '%%%%' in log-format expressions.\n",
 	        curproxy->conf.args.file, curproxy->conf.args.line, var, fmt_directive(curproxy));
 	var[var_len] = j;
 	return -1;
@@ -330,16 +344,17 @@ void add_sample_to_logformat_list(char *text, char *arg, int arg_len, struct pro
 	struct sample_expr *expr;
 	struct logformat_node *node;
 	int cmd_arg;
+	char *errmsg = NULL;
 
 	cmd[0] = text;
 	cmd[1] = "";
 	cmd_arg = 0;
 
-	expr = sample_parse_expr(cmd, &cmd_arg, trash.str, trash.size, &curpx->conf.args);
+	expr = sample_parse_expr(cmd, &cmd_arg, &errmsg, &curpx->conf.args);
 	if (!expr) {
 		Warning("parsing [%s:%d] : '%s' : sample fetch <%s> failed with : %s\n",
 		        curpx->conf.args.file, curpx->conf.args.line, fmt_directive(curpx),
-		        text, trash.str);
+		        text, errmsg);
 		return;
 	}
 
@@ -430,12 +445,21 @@ void parse_logformat_string(const char *fmt, struct proxy *curproxy, struct list
 				cformat = LF_STEXPR;
 				var = str + 1;         // store expr in variable name
 			}
-			else if (isalnum((int)*str)) { // variable name
+			else if (isalpha((unsigned char)*str)) { // variable name
 				cformat = LF_VAR;
 				var = str;
 			}
 			else if (*str == '%')
 				cformat = LF_TEXT;     // convert this character to a litteral (useful for '%')
+			else if (isdigit((unsigned char)*str) || *str == ' ' || *str == '\t') {
+				/* single '%' followed by blank or digit, send them both */
+				cformat = LF_TEXT;
+				pformat = LF_TEXT; /* finally we include the previous char as well */
+				sp = str - 1; /* send both the '%' and the current char */
+				Warning("parsing [%s:%d] : Fixed missing '%%' before '%c' at position %d in %s line : '%s'. Please use '%%%%' when you need the '%%' character in a log-format expression.\n",
+					curproxy->conf.args.file, curproxy->conf.args.line, *str, (int)(str - backfmt), fmt_directive(curproxy), fmt);
+
+			}
 			else
 				cformat = LF_INIT;     // handle other cases of litterals
 			break;
@@ -454,7 +478,7 @@ void parse_logformat_string(const char *fmt, struct proxy *curproxy, struct list
 				var = str + 1;         // store expr in variable name
 				break;
 			}
-			else if (isalnum((int)*str)) { // variable name
+			else if (isalnum((unsigned char)*str)) { // variable name
 				cformat = LF_VAR;
 				var = str;
 				break;
@@ -474,7 +498,7 @@ void parse_logformat_string(const char *fmt, struct proxy *curproxy, struct list
 
 		case LF_VAR:                           // text part of a variable name
 			var_len = str - var;
-			if (!isalnum((int)*str))
+			if (!isalnum((unsigned char)*str))
 				cformat = LF_INIT;     // not variable name anymore
 			break;
 
@@ -847,7 +871,7 @@ void __send_log(struct proxy *p, int level, char *message, size_t size)
 		} while (fac_level && log_ptr > dataptr);
 		*log_ptr = '<';
 
-		sent = sendto(*plogfd, log_ptr, size + log_ptr - dataptr,
+		sent = sendto(*plogfd, log_ptr, size - (log_ptr - dataptr),
 			      MSG_DONTWAIT | MSG_NOSIGNAL,
 			      (struct sockaddr *)&logsrv->addr, get_addr_len(&logsrv->addr));
 		if (sent < 0) {
@@ -912,6 +936,7 @@ int build_logline(struct session *s, char *dst, size_t maxsize, struct list *lis
 		return 0;
 
 	list_for_each_entry(tmp, list_format, list) {
+		struct connection *conn;
 		const char *src = NULL;
 		struct sample *key;
 
@@ -946,8 +971,11 @@ int build_logline(struct session *s, char *dst, size_t maxsize, struct list *lis
 				break;
 
 			case LOG_FMT_CLIENTIP:  // %ci
-				ret = lf_ip(tmplog, (struct sockaddr *)&s->req->prod->conn->addr.from,
-					    dst + maxsize - tmplog, tmp);
+				conn = objt_conn(s->req->prod->end);
+				if (conn)
+					ret = lf_ip(tmplog, (struct sockaddr *)&conn->addr.from, dst + maxsize - tmplog, tmp);
+				else
+					ret = lf_text_len(tmplog, NULL, 0, dst + maxsize - tmplog, tmp);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -955,12 +983,18 @@ int build_logline(struct session *s, char *dst, size_t maxsize, struct list *lis
 				break;
 
 			case LOG_FMT_CLIENTPORT:  // %cp
-				if (s->req->prod->conn->addr.from.ss_family == AF_UNIX) {
-					ret = ltoa_o(s->listener->luid, tmplog, dst + maxsize - tmplog);
-				} else {
-					ret = lf_port(tmplog, (struct sockaddr *)&s->req->prod->conn->addr.from,
-						      dst + maxsize - tmplog, tmp);
+				conn = objt_conn(s->req->prod->end);
+				if (conn) {
+					if (conn->addr.from.ss_family == AF_UNIX) {
+						ret = ltoa_o(s->listener->luid, tmplog, dst + maxsize - tmplog);
+					} else {
+						ret = lf_port(tmplog, (struct sockaddr *)&conn->addr.from,
+						              dst + maxsize - tmplog, tmp);
+					}
 				}
+				else
+					ret = lf_text_len(tmplog, NULL, 0, dst + maxsize - tmplog, tmp);
+
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -968,9 +1002,14 @@ int build_logline(struct session *s, char *dst, size_t maxsize, struct list *lis
 				break;
 
 			case LOG_FMT_FRONTENDIP: // %fi
-				conn_get_to_addr(s->req->prod->conn);
-				ret = lf_ip(tmplog, (struct sockaddr *)&s->req->prod->conn->addr.to,
-					    dst + maxsize - tmplog, tmp);
+				conn = objt_conn(s->req->prod->end);
+				if (conn) {
+					conn_get_to_addr(conn);
+					ret = lf_ip(tmplog, (struct sockaddr *)&conn->addr.to, dst + maxsize - tmplog, tmp);
+				}
+				else
+					ret = lf_text_len(tmplog, NULL, 0, dst + maxsize - tmplog, tmp);
+
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -978,14 +1017,17 @@ int build_logline(struct session *s, char *dst, size_t maxsize, struct list *lis
 				break;
 
 			case  LOG_FMT_FRONTENDPORT: // %fp
-				conn_get_to_addr(s->req->prod->conn);
-				if (s->req->prod->conn->addr.to.ss_family == AF_UNIX) {
-					ret = ltoa_o(s->listener->luid,
-						     tmplog, dst + maxsize - tmplog);
-				} else {
-					ret = lf_port(tmplog, (struct sockaddr *)&s->req->prod->conn->addr.to,
-						      dst + maxsize - tmplog, tmp);
+				conn = objt_conn(s->req->prod->end);
+				if (conn) {
+					conn_get_to_addr(conn);
+					if (conn->addr.to.ss_family == AF_UNIX)
+						ret = ltoa_o(s->listener->luid, tmplog, dst + maxsize - tmplog);
+					else
+						ret = lf_port(tmplog, (struct sockaddr *)&conn->addr.to, dst + maxsize - tmplog, tmp);
 				}
+				else
+					ret = lf_text_len(tmplog, NULL, 0, dst + maxsize - tmplog, tmp);
+
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -993,8 +1035,12 @@ int build_logline(struct session *s, char *dst, size_t maxsize, struct list *lis
 				break;
 
 			case LOG_FMT_BACKENDIP:  // %bi
-				ret = lf_ip(tmplog, (struct sockaddr *)&s->req->cons->conn->addr.from,
-					    dst + maxsize - tmplog, tmp);
+				conn = objt_conn(s->req->cons->end);
+				if (conn)
+					ret = lf_ip(tmplog, (struct sockaddr *)&conn->addr.from, dst + maxsize - tmplog, tmp);
+				else
+					ret = lf_text_len(tmplog, NULL, 0, dst + maxsize - tmplog, tmp);
+
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -1002,8 +1048,12 @@ int build_logline(struct session *s, char *dst, size_t maxsize, struct list *lis
 				break;
 
 			case LOG_FMT_BACKENDPORT:  // %bp
-				ret = lf_port(tmplog, (struct sockaddr *)&s->req->cons->conn->addr.from,
-					      dst + maxsize - tmplog, tmp);
+				conn = objt_conn(s->req->cons->end);
+				if (conn)
+					ret = lf_port(tmplog, (struct sockaddr *)&conn->addr.from, dst + maxsize - tmplog, tmp);
+				else
+					ret = lf_text_len(tmplog, NULL, 0, dst + maxsize - tmplog, tmp);
+
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -1011,8 +1061,12 @@ int build_logline(struct session *s, char *dst, size_t maxsize, struct list *lis
 				break;
 
 			case LOG_FMT_SERVERIP: // %si
-				ret = lf_ip(tmplog, (struct sockaddr *)&s->req->cons->conn->addr.to,
-					    dst + maxsize - tmplog, tmp);
+				conn = objt_conn(s->req->cons->end);
+				if (conn)
+					ret = lf_ip(tmplog, (struct sockaddr *)&conn->addr.to, dst + maxsize - tmplog, tmp);
+				else
+					ret = lf_text_len(tmplog, NULL, 0, dst + maxsize - tmplog, tmp);
+
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -1020,8 +1074,12 @@ int build_logline(struct session *s, char *dst, size_t maxsize, struct list *lis
 				break;
 
 			case LOG_FMT_SERVERPORT: // %sp
-				ret = lf_port(tmplog, (struct sockaddr *)&s->req->cons->conn->addr.to,
-					      dst + maxsize - tmplog, tmp);
+				conn = objt_conn(s->req->cons->end);
+				if (conn)
+					ret = lf_port(tmplog, (struct sockaddr *)&conn->addr.to, dst + maxsize - tmplog, tmp);
+				else
+					ret = lf_text_len(tmplog, NULL, 0, dst + maxsize - tmplog, tmp);
+
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -1120,8 +1178,11 @@ int build_logline(struct session *s, char *dst, size_t maxsize, struct list *lis
 #ifdef USE_OPENSSL
 			case LOG_FMT_SSL_CIPHER: // %sslc
 				src = NULL;
-				if (s->listener->xprt == &ssl_sock)
-					src = ssl_sock_get_cipher_name(s->si[0].conn);
+				conn = objt_conn(s->si[0].end);
+				if (conn) {
+					if (s->listener->xprt == &ssl_sock)
+						src = ssl_sock_get_cipher_name(conn);
+				}
 				ret = lf_text(tmplog, src, dst + maxsize - tmplog, tmp);
 				if (ret == NULL)
 					goto out;
@@ -1131,8 +1192,11 @@ int build_logline(struct session *s, char *dst, size_t maxsize, struct list *lis
 
 			case LOG_FMT_SSL_VERSION: // %sslv
 				src = NULL;
-				if (s->listener->xprt == &ssl_sock)
-					src = ssl_sock_get_proto_version(s->si[0].conn);
+				conn = objt_conn(s->si[0].end);
+				if (conn) {
+					if (s->listener->xprt == &ssl_sock)
+						src = ssl_sock_get_proto_version(conn);
+				}
 				ret = lf_text(tmplog, src, dst + maxsize - tmplog, tmp);
 				if (ret == NULL)
 					goto out;
@@ -1448,13 +1512,13 @@ int build_logline(struct session *s, char *dst, size_t maxsize, struct list *lis
 
 			case LOG_FMT_COUNTER: // %rt
 				if (tmp->options & LOG_OPT_HEXA) {
-					iret = snprintf(tmplog, dst + maxsize - tmplog, "%04X", global.req_count);
+					iret = snprintf(tmplog, dst + maxsize - tmplog, "%04X", global.req_count++);
 					if (iret < 0 || iret > dst + maxsize - tmplog)
 						goto out;
 					last_isspace = 0;
 					tmplog += iret;
 				} else {
-					ret = ltoa_o(global.req_count, tmplog, dst + maxsize - tmplog);
+					ret = ltoa_o(global.req_count++, tmplog, dst + maxsize - tmplog);
 					if (ret == NULL)
 						goto out;
 					tmplog = ret;
@@ -1488,8 +1552,10 @@ int build_logline(struct session *s, char *dst, size_t maxsize, struct list *lis
 				break;
 
 			case LOG_FMT_UNIQUEID: // %ID
+				ret = NULL;
 				src = s->unique_id;
-				ret = lf_text(tmplog, src, maxsize - (tmplog - dst), tmp);
+				if (src)
+					ret = lf_text(tmplog, src, maxsize - (tmplog - dst), tmp);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -1539,6 +1605,12 @@ void sess_log(struct session *s)
 		level = LOG_INFO;
 		if (err && (s->fe->options2 & PR_O2_LOGERRORS))
 			level = LOG_ERR;
+	}
+
+	/* if unique-id was not generated */
+	if (!s->unique_id && !LIST_ISEMPTY(&s->fe->format_unique_id)) {
+		if ((s->unique_id = pool_alloc2(pool2_uniqueid)) != NULL)
+			build_logline(s, s->unique_id, UNIQUEID_LEN, &s->fe->format_unique_id);
 	}
 
 	tmplog = update_log_hdr();

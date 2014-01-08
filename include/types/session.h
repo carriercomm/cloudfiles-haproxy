@@ -90,14 +90,16 @@
 
 #define SN_COMP_READY   0x00100000	/* the compression is initialized */
 
-/* session tracking flags: these ones must absolutely be contiguous. See also s->stkctr */
+/* session tracking flags: these ones must absolutely be contiguous and cover
+ * at least MAX_SESS_STKCTR flags.
+ */
 #define SN_BE_TRACK_SC0 0x00200000	/* backend tracks stick-counter 0 */
 #define SN_BE_TRACK_SC1 0x00400000	/* backend tracks stick-counter 1 */
 #define SN_BE_TRACK_SC2 0x00800000	/* backend tracks stick-counter 2 */
 #define SN_BE_TRACK_ANY 0x00E00000      /* union of all SN_BE_TRACK_* above */
 
 
-/* WARNING: if new fields are added, they must be initialized in event_accept()
+/* WARNING: if new fields are added, they must be initialized in session_accept()
  * and freed in session_free() !
  */
 
@@ -120,7 +122,8 @@ struct stkctr {
  */
 struct session {
 	int flags;				/* some flags describing the session */
-	enum obj_type *target;			/* target to use for this session */
+	unsigned int uniq_id;			/* unique ID used for the traces */
+	enum obj_type *target;			/* target to use for this session ; for mini-sess: incoming connection */
 
 	struct channel *req;			/* request buffer */
 	struct channel *rep;			/* response buffer */
@@ -142,11 +145,11 @@ struct session {
 	struct {
 		struct stksess *ts;
 		struct stktable *table;
-		int flags;
 	} store[8];				/* tracked stickiness values to store */
 	int store_count;
+	/* 4 unused bytes here */
 
-	struct stkctr stkctr[3];                /* stick counters */
+	struct stkctr stkctr[MAX_SESS_STKCTR];  /* stick counters */
 
 	struct stream_interface si[2];          /* client and server stream interfaces */
 	struct {
@@ -167,7 +170,6 @@ struct session {
 	void (*do_log)(struct session *s);	/* the function to call in order to log (or NULL) */
 	void (*srv_error)(struct session *s,	/* the function to call upon unrecoverable server errors (or NULL) */
 			  struct stream_interface *si);
-	unsigned int uniq_id;			/* unique ID used for the traces */
 	struct comp_ctx *comp_ctx;		/* HTTP compression context */
 	struct comp_algo *comp_algo;		/* HTTP compression algorithm if not NULL */
 	char *unique_id;			/* custom unique ID */

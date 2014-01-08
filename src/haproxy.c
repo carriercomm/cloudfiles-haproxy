@@ -193,6 +193,11 @@ const struct linger nolinger = { .l_onoff = 1, .l_linger = 0 };
 char hostname[MAX_HOSTNAME_LEN];
 char localpeer[MAX_HOSTNAME_LEN];
 
+/* used from everywhere just to drain results we don't want to read and which
+ * recent versions of gcc increasingly and annoyingly complain about.
+ */
+int shut_your_big_mouth_gcc_int = 0;
+
 /* list of the temporarily limited listeners because of lack of resource */
 struct list global_listener_queue = LIST_HEAD_INIT(global_listener_queue);
 struct task *global_listener_queue_task;
@@ -491,6 +496,7 @@ void init(int argc, char **argv)
 	struct tm curtime;
 
 	chunk_init(&trash, malloc(global.tune.bufsize), global.tune.bufsize);
+	alloc_trash_buffers(global.tune.bufsize);
 
 	/* NB: POSIX does not make it mandatory for gethostname() to NULL-terminate
 	 * the string in case of truncation, and at least FreeBSD appears not to do
@@ -817,7 +823,6 @@ void init(int argc, char **argv)
 	swap_buffer = (char *)calloc(1, global.tune.bufsize);
 	get_http_auth_buff = (char *)calloc(1, global.tune.bufsize);
 	static_table_key = calloc(1, sizeof(*static_table_key) + global.tune.bufsize);
-	alloc_trash_buffers(global.tune.bufsize);
 
 	fdinfo = (struct fdinfo *)calloc(1,
 				       sizeof(struct fdinfo) * (global.maxsock));
@@ -975,6 +980,7 @@ void deinit(void)
 		free(p->conf.lfs_file);
 		free(p->conf.uniqueid_format_string);
 		free(p->conf.uif_file);
+		free(p->lbprm.map.srv);
 
 		for (i = 0; i < HTTP_ERR_SIZE; i++)
 			chunk_destroy(&p->errmsg[i]);
@@ -1072,6 +1078,10 @@ void deinit(void)
 				free(rdr->cond);
 			}
 			free(rdr->rdr_str);
+			list_for_each_entry_safe(lf, lfb, &rdr->rdr_fmt, list) {
+				LIST_DEL(&lf->list);
+				free(lf);
+			}
 			free(rdr);
 		}
 
@@ -1119,6 +1129,10 @@ void deinit(void)
 				task_delete(s->check.task);
 				task_free(s->check.task);
 			}
+			if (s->agent.task) {
+				task_delete(s->agent.task);
+				task_free(s->agent.task);
+			}
 
 			if (s->warmup) {
 				task_delete(s->warmup);
@@ -1129,6 +1143,8 @@ void deinit(void)
 			free(s->cookie);
 			free(s->check.bi);
 			free(s->check.bo);
+			free(s->agent.bi);
+			free(s->agent.bo);
 			free(s);
 			s = s_next;
 		}/* end while(s) */
@@ -1198,6 +1214,7 @@ void deinit(void)
 	free(global.pidfile); global.pidfile = NULL;
 	free(global.node);    global.node = NULL;
 	free(global.desc);    global.desc = NULL;
+	free(fdinfo);         fdinfo  = NULL;
 	free(fdtab);          fdtab   = NULL;
 	free(oldpids);        oldpids = NULL;
 	free(global_listener_queue_task); global_listener_queue_task = NULL;
@@ -1529,7 +1546,7 @@ int main(int argc, char **argv)
 			if (pidfd >= 0) {
 				char pidstr[100];
 				snprintf(pidstr, sizeof(pidstr), "%d\n", ret);
-				if (write(pidfd, pidstr, strlen(pidstr)) < 0) /* shut gcc warning */;
+				shut_your_big_mouth_gcc(write(pidfd, pidstr, strlen(pidstr)));
 			}
 			relative_pid++; /* each child will get a different one */
 		}
