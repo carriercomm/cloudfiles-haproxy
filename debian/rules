@@ -45,3 +45,4 @@ override_dh_auto_install:
 
 override_dh_installinit:
 	dh_installinit --no-start
+	dh_installinit --no-start -phaproxy --init-script=haproxy
